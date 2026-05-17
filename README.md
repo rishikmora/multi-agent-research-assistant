@@ -1,172 +1,265 @@
-# Multi-Agent Research Assistant
+# MARS — Multi-Agent Research System
 
-Production-grade research pipeline powered by 5 specialist AI agents, LangGraph orchestration, FastAPI, Next.js, and a full observability stack.
+> Six AI agents research, debate, and synthesise any topic in real time.
 
-## Architecture
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat-square&logo=fastapi&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=black)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?style=flat-square&logo=typescript&logoColor=white)
+![Claude](https://img.shields.io/badge/Claude-Sonnet_4.6-7c6dff?style=flat-square)
+
+---
+
+## What it does
+
+Type a research question. Watch six specialist agents work in parallel, argue with each other, and converge on a verified, confidence-scored answer — streamed live to your browser.
 
 ```
-User Query
-    │
-    ▼
-┌─────────────────────────────────────┐
-│         Orchestrator Agent          │  Query analysis, complexity scoring
-└─────────────────┬───────────────────┘
-                  │
-    ┌─────────────▼───────────────┐
-    │         Planner Agent       │  Subtask decomposition, scope enforcement
-    └─────────────┬───────────────┘
-                  │ (parallel)
-    ┌─────────────▼───────────────┐
-    │  Researcher A ∥ Researcher B│  Web + academic search, semaphore-limited
-    └─────────────┬───────────────┘
-                  │
-    ┌─────────────▼───────────────┐
-    │         Critic Agent        │  Gap analysis, confidence scoring
-    └──────┬──────────────┬───────┘
-           │ refine        │ done
-    (loop≤2)              │
-           └──────────────┼──→ Synthesizer → Report
-                          ▼
-                  Structured Report
-                  (sections + citations + confidence scores)
+Planner → Researcher A ──┐
+                          ├─→ Critic → Skeptic → Debate (4 rounds) → Synthesizer
+         Researcher B ──┘
 ```
 
-## What makes this different
+Each agent has a distinct role and reasoning style. The Skeptic actively tries to break what the Researchers found. The Debate rounds surface real disagreement. The final report shows how confident each conclusion actually is.
 
-| Feature | Ours | CrewAI | AutoGen | LangGraph |
-|---|---|---|---|---|
-| Structural verification (separate Critic) | ✓ | ✗ | ~ | ~ |
-| Confidence scoring per section | ✓ | ✗ | ✗ | ✗ |
-| Bounded refinement with hard cap | ✓ | ✗ | ✗ | ✓ |
-| Task scope enforcement (no overlap) | ✓ | ~ | ✗ | ~ |
-| SSE streaming agent events | ✓ | ✗ | ✗ | ~ |
-| Full Prometheus + Grafana observability | ✓ | ~ | ✗ | ~ |
-| pgvector semantic memory | ✓ | ✗ | ✗ | ~ |
+---
 
-## Tech stack
+## Stack
 
-**Backend**
-- FastAPI 0.115 + Uvicorn + Gunicorn (4 workers)
-- LangGraph 0.2 — stateful graph with PostgreSQL checkpointing
-- Anthropic Claude (Opus for orchestration, Sonnet for research/critique)
-- PostgreSQL 16 + pgvector — persistent state + semantic search
-- Redis 7 — session queues, SSE fan-out, token budget tracking
-- Prometheus + structlog — full observability
+| Layer | Tech |
+|---|---|
+| LLM | Claude Sonnet 4.6 via Anthropic API |
+| Backend | FastAPI + SSE streaming |
+| Frontend | React 18 + TypeScript + Vite |
+| State | Custom `usePipeline` hook (SSE → React state) |
+| Fonts | DM Sans + DM Mono |
 
-**Frontend**
-- Next.js 15 (App Router) + TypeScript
-- Zustand — SSE-connected pipeline state
-- Framer Motion — agent step animations
-- Tailwind CSS
-
-**Infrastructure**
-- Docker Compose (dev) / Kubernetes (prod)
-- Nginx — SSE-aware reverse proxy (buffering disabled on stream endpoints)
-- Grafana dashboards — LLM latency, token burn, pipeline throughput
+---
 
 ## Quickstart
 
+### 1 — Clone and set up
+
 ```bash
-# 1. Clone and configure
-cp .env.example .env
-# Edit .env — set ANTHROPIC_API_KEY at minimum
-
-# 2. Start all services
-docker compose up -d
-
-# 3. Verify
-curl http://localhost:8000/health
-
-# 4. Open the UI
-open http://localhost:3000/research
+git clone <your-repo>
+cd mars
 ```
 
-## API
-
-### Start research
-```bash
-POST /api/v1/research
-Content-Type: application/json
-
-{
-  "query": "Your research question",
-  "depth": "standard",        # quick | standard | deep
-  "max_sources": 20,
-  "include_arxiv": true
-}
-
-# Returns: { "session_id": "uuid", "status": "queued" }
-```
-
-### Stream live events
-```bash
-GET /api/v1/research/{session_id}/stream
-# Server-Sent Events stream with typed events:
-# pipeline_start | agent_start | agent_progress | agent_complete
-# sources_found | refinement_loop | report_section
-# pipeline_complete | pipeline_error
-```
-
-### Get completed report (polling fallback)
-```bash
-GET /api/v1/research/{session_id}
-```
-
-## Development
+### 2 — Backend
 
 ```bash
-# Backend
 cd backend
-poetry install
-cp ../.env.example .env
-uvicorn app.main:app --reload --port 8000
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 
-# Frontend
+cp .env.example .env
+# Open .env and add your key:
+# ANTHROPIC_API_KEY=sk-ant-...
+
+uvicorn main:app --reload --port 8000
+```
+
+Confirm it's running:
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","model":"claude-sonnet-4-6"}
+```
+
+### 3 — Frontend
+
+```bash
 cd frontend
 npm install
 npm run dev
-
-# Tests
-cd backend
-pytest tests/ -v --cov=app --cov-report=term-missing
-
-# Type checking
-mypy app/
+# → http://localhost:3000
 ```
 
-## Production deployment
+---
 
-### Environment checklist
-- [ ] `SECRET_KEY` is 32+ chars, randomly generated
-- [ ] `ANTHROPIC_API_KEY` is set
-- [ ] `ENVIRONMENT=production` (disables /docs, /openapi.json)
-- [ ] `POSTGRES_PASSWORD` is strong and unique
-- [ ] `CORS_ORIGINS` is restricted to your actual domain
-- [ ] `BRAVE_API_KEY` or `SERPAPI_KEY` for real search results
-- [ ] `LANGFUSE_*` keys for LLM tracing
-- [ ] `SENTRY_DSN` for error tracking
+## Project structure
 
-### Kubernetes
+```
+mars/
+├── backend/
+│   ├── main.py              # FastAPI app, all 6 agents, SSE pipeline, debate engine
+│   ├── requirements.txt
+│   └── .env.example
+│
+└── frontend/
+    ├── src/
+    │   ├── App.tsx           # Full UI — agents, debate, beliefs, benchmarks
+    │   ├── index.css         # Global styles, animations, font imports
+    │   ├── main.tsx          # React entry point
+    │   ├── hooks/
+    │   │   └── usePipeline.ts  # SSE connection + all pipeline state
+    │   └── types/
+    │       └── index.ts      # Shared TypeScript types
+    ├── index.html
+    ├── package.json
+    ├── tsconfig.json
+    └── vite.config.ts
+```
+
+---
+
+## How the pipeline works
+
+### Agents
+
+| Agent | Role | Model behaviour |
+|---|---|---|
+| **Planner** | Decomposes the query into 3 focused sub-tasks | Conservative — sets scope boundaries |
+| **Researcher A** | Primary evidence gathering | Specific: names, dates, statistics |
+| **Researcher B** | Domain-specialist analysis | Technical: benchmarks, patents, filings |
+| **Critic** | Gap and contradiction scanner | Identifies what's missing or unsupported |
+| **Skeptic** | Active counter-evidence finder | Directly attacks the strongest claims |
+| **Synthesizer** | Final report writer | Produces confidence-scored executive summary |
+
+### Debate (4 rounds)
+
+After the 5 research agents complete, a structured debate runs using their actual outputs as evidence:
+
+1. **Advocate** — argues for the strongest finding
+2. **Challenger** — directly counters with the Skeptic's evidence
+3. **Specialist** — adds the technical dimension both sides missed
+4. **Verdict** — discriminator synthesises consensus + flags unresolved uncertainty
+
+### Streaming
+
+Every step streams via Server-Sent Events. The frontend `usePipeline` hook reads the SSE stream and updates React state in real time — no polling, no websockets, no client-side timeouts.
+
+### Belief evolution
+
+After synthesis completes, confidence snapshots are taken at each pipeline stage to show how evidence shifted the belief from prior → final.
+
+---
+
+## API
+
+### `POST /research/stream`
+
+Starts a pipeline and streams SSE events.
+
+**Request body:**
+```json
+{ "query": "Your research question here" }
+```
+
+**Event types streamed:**
+
+| Event | When |
+|---|---|
+| `pipeline_start` | Immediately on POST |
+| `agent_start` | Each agent begins |
+| `agent_done` | Each agent finishes (includes output + confidence) |
+| `debate_round_start` | Each of the 4 debate rounds begins |
+| `debate_round_done` | Each debate round finishes (text + consensus %) |
+| `pipeline_complete` | Everything done (includes metrics + belief snapshots) |
+| `agent_error` | If any agent fails |
+
+**Example — curl:**
+
 ```bash
-kubectl apply -f infra/k8s/
+curl -N -X POST http://localhost:8000/research/stream \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What broke in AI in 2025?"}'
 ```
 
-### Scaling notes
-- Horizontal scale the backend with `WORKERS` env var or K8s replicas
-- Redis must be shared across all backend instances for SSE consistency
-- LangGraph checkpoints go to PostgreSQL — no in-memory state
-- With Redis pub/sub, SSE works across multiple backend pods
+### `GET /health`
 
-## Key design decisions
+```json
+{ "status": "ok", "model": "claude-sonnet-4-6" }
+```
 
-**Why SSE over WebSockets?**
-Agent events are strictly server→client. SSE is simpler, HTTP/1.1 compatible, auto-reconnects, and works through nginx without sticky sessions.
+---
 
-**Why bounded refinement (max 2)?**
-Production research from Anthropic's own multi-agent team shows sparse topics cause infinite refinement loops. Hard-capping at 2 iterations, then noting gaps in the report, is the right tradeoff.
+## UI tabs
 
-**Why separate Critic?**
-Shared context between researcher and verifier creates correlated errors — the model that wrote the findings will tend to verify them. Structural separation is the only reliable fix.
+| Tab | What you see |
+|---|---|
+| **Agents** | Live status cards for all 6 agents. Click "done" cards to expand output. Final synthesis appears at the bottom. |
+| **Debate** | 4-round structured debate with live consensus meter. |
+| **Beliefs** | Confidence timeline per belief — prior → each agent stage → final. |
+| **Benchmarks** | Quality metrics (hallucination rate, citation grounding, agent agreement, quality score) compared against vanilla GPT-4 and single-agent RAG baselines. |
 
-**Why LangGraph over CrewAI?**
-LangGraph gives us deterministic graph edges, PostgreSQL checkpointing (resumable on failure), and `conditional_edges` for the refinement routing. CrewAI's role-based model is easier to start but harder to make reliable.
+---
+
+## Configuration
+
+All config lives in `backend/main.py` — change the constants at the top:
+
+```python
+MODEL = "claude-sonnet-4-6"          # swap model here
+```
+
+Each agent's behaviour is controlled by its `system` prompt in the `AGENTS` dict. Edit these to change how each agent reasons.
+
+Frontend API URL is set via Vite env var:
+
+```bash
+# frontend/.env.local
+VITE_API_URL=http://localhost:8000
+```
+
+---
+
+## Deploy
+
+### Backend → Railway
+
+```bash
+railway init
+railway add --plugin postgres    # optional — not required for base MARS
+railway env set ANTHROPIC_API_KEY=sk-ant-...
+railway up
+```
+
+### Backend → Render
+
+1. New Web Service → connect repo
+2. Build command: `pip install -r requirements.txt`
+3. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+4. Add env var: `ANTHROPIC_API_KEY`
+
+### Frontend → Vercel
+
+```bash
+cd frontend
+vercel
+# Set VITE_API_URL to your backend URL in Vercel project settings
+```
+
+---
+
+## Theme
+
+The modern dark UI uses:
+
+- **DM Sans** — body text, UI labels
+- **DM Mono** — status text, tags, technical labels
+- Sidebar layout with per-agent status column
+- Color-coded agents with animated status dots
+- 4-tab main panel (agents / debate / beliefs / benchmarks)
+
+A classic editorial light theme (`App.classic.tsx`) is included in the `frontend-designs/` folder if you prefer that look.
+
+---
+
+## Cost
+
+A typical research run makes ~10 API calls, each 200–500 tokens output.
+
+| Run type | Approx. cost |
+|---|---|
+| Standard query | ~$0.05–0.10 |
+| Complex query (longer outputs) | ~$0.15–0.25 |
+
+Using `claude-sonnet-4-6` at $3/$15 per M tokens input/output.
+
+---
+
+## License
+
+MIT
