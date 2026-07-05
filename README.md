@@ -1,265 +1,204 @@
-# MARS — Multi-Agent Research System
+# MARS Three-Tier Memory System
 
-> Six AI agents research, debate, and synthesise any topic in real time.
+Production implementation of Week 1 from the intelligence upgrade roadmap.
 
-![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat-square&logo=fastapi&logoColor=white)
-![React](https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=black)
-![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?style=flat-square&logo=typescript&logoColor=white)
-![Claude](https://img.shields.io/badge/Claude-Sonnet_4.6-7c6dff?style=flat-square)
-
----
-
-## What it does
-
-Type a research question. Watch six specialist agents work in parallel, argue with each other, and converge on a verified, confidence-scored answer — streamed live to your browser.
+## Architecture
 
 ```
-Planner → Researcher A ──┐
-                          ├─→ Critic → Skeptic → Debate (4 rounds) → Synthesizer
-         Researcher B ──┘
+┌─────────────────────────────────────────────────────────────────┐
+│  TIER 1 — Working Memory (Redis)                                │
+│  Scope: current session only. TTL: 2 hours.                     │
+│  - Agent outputs as they complete                                │
+│  - Live confidence scores (atomic Lua-script updates)           │
+│  - Debate transcript (bounded to 30 messages)                   │
+│  - Live evidence graph state                                     │
+│  - Pub/sub for cross-process SSE notification                    │
+└───────────────────────┬───────────────────────────────────────────┘
+                        │ finalize_session() on pipeline completion
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  TIER 2 — Episodic Memory (PostgreSQL)                          │
+│  Scope: permanent record of every completed session.             │
+│  - Append-only — never mutated, only superseded                  │
+│  - Fast-path topic index for exact/fuzzy lookup                  │
+│  - Retention: 180 days for superseded episodes (current           │
+│    conclusions on any topic are kept indefinitely)                │
+└───────────────────────┬───────────────────────────────────────────┘
+                        │ consolidate_session() — async background task
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  TIER 3 — Semantic Memory (PostgreSQL + pgvector)                │
+│  Scope: durable, cross-session, cross-user distilled facts.       │
+│  - HNSW index: m=16, ef_construction=96 (production-tuned)       │
+│  - Reinforcement: corroborating episodes boost confidence         │
+│    with diminishing returns (asymptotic to 0.97)                  │
+│  - Decay: unreinforced facts lose confidence — half-life 90 days  │
+│  - Conflicts are FLAGGED, never silently auto-resolved             │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-Each agent has a distinct role and reasoning style. The Skeptic actively tries to break what the Researchers found. The Debate rounds surface real disagreement. The final report shows how confident each conclusion actually is.
+## Files
 
----
+```
+backend/
+├── memory/
+│   ├── working.py         Tier 1 — Redis working memory
+│   ├── episodic.py        Tier 2 — PostgreSQL episodic memory
+│   ├── semantic.py        Tier 3 — pgvector semantic memory
+│   ├── retriever.py        Unified orchestration layer (the ONLY
+│   │                       module agents should import from)
+│   └── integration.py      Wiring into Planner/Researcher/Critic agents
+├── api/
+│   └── memory_endpoints.py FastAPI routes backing the dashboard
+├── db/
+│   └── 003_memory_tiers.sql Migration — run this against your DB
+├── tests/memory/
+│   ├── conftest.py
+│   ├── test_working_memory.py    18 tests — concurrency, TTL, bounds
+│   ├── test_episodic_memory.py   16 tests — writes, supersession, pruning
+│   └── test_semantic_memory.py   19 tests — consolidation, decay, conflicts
+└── requirements-memory.txt
 
-## Stack
+frontend/
+└── src/components/
+    └── MemoryPanel.tsx      Live dashboard — stats, conflicts, retrieval preview
+```
 
-| Layer | Tech |
-|---|---|
-| LLM | Claude Sonnet 4.6 via Anthropic API |
-| Backend | FastAPI + SSE streaming |
-| Frontend | React 18 + TypeScript + Vite |
-| State | Custom `usePipeline` hook (SSE → React state) |
-| Fonts | DM Sans + DM Mono |
+## Setup
 
----
-
-## Quickstart
-
-### 1 — Clone and set up
+### 1. Database migration
 
 ```bash
-git clone <your-repo>
-cd mars
+psql $DATABASE_URL -f backend/db/003_memory_tiers.sql
 ```
 
-### 2 — Backend
+### 2. Install dependencies
 
 ```bash
-cd backend
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# Open .env and add your key:
-# ANTHROPIC_API_KEY=sk-ant-...
-
-uvicorn main:app --reload --port 8000
+pip install -r backend/requirements-memory.txt --break-system-packages
 ```
 
-Confirm it's running:
-
-```bash
-curl http://localhost:8000/health
-# {"status":"ok","model":"claude-sonnet-4-6"}
-```
-
-### 3 — Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-# → http://localhost:3000
-```
-
----
-
-## Project structure
-
-```
-mars/
-├── backend/
-│   ├── main.py              # FastAPI app, all 6 agents, SSE pipeline, debate engine
-│   ├── requirements.txt
-│   └── .env.example
-│
-└── frontend/
-    ├── src/
-    │   ├── App.tsx           # Full UI — agents, debate, beliefs, benchmarks
-    │   ├── index.css         # Global styles, animations, font imports
-    │   ├── main.tsx          # React entry point
-    │   ├── hooks/
-    │   │   └── usePipeline.ts  # SSE connection + all pipeline state
-    │   └── types/
-    │       └── index.ts      # Shared TypeScript types
-    ├── index.html
-    ├── package.json
-    ├── tsconfig.json
-    └── vite.config.ts
-```
-
----
-
-## How the pipeline works
-
-### Agents
-
-| Agent | Role | Model behaviour |
-|---|---|---|
-| **Planner** | Decomposes the query into 3 focused sub-tasks | Conservative — sets scope boundaries |
-| **Researcher A** | Primary evidence gathering | Specific: names, dates, statistics |
-| **Researcher B** | Domain-specialist analysis | Technical: benchmarks, patents, filings |
-| **Critic** | Gap and contradiction scanner | Identifies what's missing or unsupported |
-| **Skeptic** | Active counter-evidence finder | Directly attacks the strongest claims |
-| **Synthesizer** | Final report writer | Produces confidence-scored executive summary |
-
-### Debate (4 rounds)
-
-After the 5 research agents complete, a structured debate runs using their actual outputs as evidence:
-
-1. **Advocate** — argues for the strongest finding
-2. **Challenger** — directly counters with the Skeptic's evidence
-3. **Specialist** — adds the technical dimension both sides missed
-4. **Verdict** — discriminator synthesises consensus + flags unresolved uncertainty
-
-### Streaming
-
-Every step streams via Server-Sent Events. The frontend `usePipeline` hook reads the SSE stream and updates React state in real time — no polling, no websockets, no client-side timeouts.
-
-### Belief evolution
-
-After synthesis completes, confidence snapshots are taken at each pipeline stage to show how evidence shifted the belief from prior → final.
-
----
-
-## API
-
-### `POST /research/stream`
-
-Starts a pipeline and streams SSE events.
-
-**Request body:**
-```json
-{ "query": "Your research question here" }
-```
-
-**Event types streamed:**
-
-| Event | When |
-|---|---|
-| `pipeline_start` | Immediately on POST |
-| `agent_start` | Each agent begins |
-| `agent_done` | Each agent finishes (includes output + confidence) |
-| `debate_round_start` | Each of the 4 debate rounds begins |
-| `debate_round_done` | Each debate round finishes (text + consensus %) |
-| `pipeline_complete` | Everything done (includes metrics + belief snapshots) |
-| `agent_error` | If any agent fails |
-
-**Example — curl:**
-
-```bash
-curl -N -X POST http://localhost:8000/research/stream \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What broke in AI in 2025?"}'
-```
-
-### `GET /health`
-
-```json
-{ "status": "ok", "model": "claude-sonnet-4-6" }
-```
-
----
-
-## UI tabs
-
-| Tab | What you see |
-|---|---|
-| **Agents** | Live status cards for all 6 agents. Click "done" cards to expand output. Final synthesis appears at the bottom. |
-| **Debate** | 4-round structured debate with live consensus meter. |
-| **Beliefs** | Confidence timeline per belief — prior → each agent stage → final. |
-| **Benchmarks** | Quality metrics (hallucination rate, citation grounding, agent agreement, quality score) compared against vanilla GPT-4 and single-agent RAG baselines. |
-
----
-
-## Configuration
-
-All config lives in `backend/main.py` — change the constants at the top:
+### 3. Wire the router into your FastAPI app
 
 ```python
-MODEL = "claude-sonnet-4-6"          # swap model here
+# backend/main.py
+from app.api.memory_endpoints import router as memory_router
+app.include_router(memory_router, prefix="/api/v1")
 ```
 
-Each agent's behaviour is controlled by its `system` prompt in the `AGENTS` dict. Edit these to change how each agent reasons.
+### 4. Mix memory into your existing agents
 
-Frontend API URL is set via Vite env var:
+```python
+# backend/agents.py
+from app.memory.integration import (
+    MemoryAwarePlannerMixin,
+    MemoryAwareResearcherMixin,
+    MemoryAwareCriticMixin,
+)
+
+class PlannerAgent(MemoryAwarePlannerMixin, BaseAgent):
+    async def _execute(self, state):
+        memory_context = await self.retrieve_memory_context(
+            query=state.query, memory=self.memory, domain=state.domain
+        )
+        prompt = self.build_planning_prompt_with_memory(base_prompt, memory_context)
+        # ... rest of planning as before
+
+class ResearcherAgent(MemoryAwareResearcherMixin, BaseAgent):
+    async def _execute(self, state):
+        # ... existing research logic
+        await self.write_through_working_memory(
+            self.working_memory, self.agent_id, finding_text, confidence
+        )
+```
+
+### 5. Finalize + consolidate at pipeline completion
+
+```python
+# backend/graph/pipeline.py — at the end of ResearchPipeline.run()
+from app.memory.integration import finalize_and_consolidate
+
+await finalize_and_consolidate(
+    memory=self.memory_retriever,
+    session_id=state.session_id,
+    query=state.query,
+    user_id=state.user_id,
+    domain=state.domain,
+    status="complete",
+    final_confidence=state.report.overall_confidence,
+    topics=[s.heading for s in state.report.sections],
+    settled_beliefs={...},
+    contradictions_found=state.metadata.get("contradiction_count", 0),
+    contradictions_resolved=state.metadata.get("resolved_count", 0),
+    source_urls=[s.url for s in state.report.all_sources],
+    avg_source_trust=avg_trust,
+    total_tokens=self.budget.used,
+    duration_seconds=elapsed,
+    refinement_iterations=state.refinement_count,
+    report_summary=state.report.executive_summary,
+    full_report_json=state.report.model_dump(mode="json"),
+)
+```
+
+### 6. Mount the frontend panel
+
+```tsx
+import { MemoryPanel } from "./components/MemoryPanel";
+
+// Add a "Memory" tab alongside Agents/Debate/Beliefs/Benchmarks
+{tab === "memory" && <MemoryPanel />}
+```
+
+## Running tests
 
 ```bash
-# frontend/.env.local
-VITE_API_URL=http://localhost:8000
+# Working memory tests (fakeredis, no external deps)
+pip install fakeredis --break-system-packages
+pytest backend/tests/memory/test_working_memory.py -v
+
+# Episodic + semantic tests (need real PostgreSQL + pgvector)
+docker run -d -p 5432:5432 \
+  -e POSTGRES_USER=mars_test -e POSTGRES_PASSWORD=mars_test \
+  -e POSTGRES_DB=mars_test_db \
+  pgvector/pgvector:pg16
+
+pytest backend/tests/memory/ -v
 ```
 
----
+53 tests total across the three tiers.
 
-## Deploy
+## Key production decisions
 
-### Backend → Railway
+**Why Lua scripts for confidence updates?**
+Two agents can finish within milliseconds of each other and both try to
+update the same topic's confidence. A naive `GET` then `SET` has a race
+window. Redis Lua scripts execute atomically — no race condition possible,
+without needing distributed locks.
 
-```bash
-railway init
-railway add --plugin postgres    # optional — not required for base MARS
-railway env set ANTHROPIC_API_KEY=sk-ant-...
-railway up
-```
+**Why is consolidation async, not inline?**
+Fact extraction requires an LLM call per session, and contradiction
+checking requires another LLM call per extracted fact. That's potentially
+5-10 seconds of latency the user should never wait for after their report
+is ready. `asyncio.create_task()` fires it off; the user sees "complete"
+immediately.
 
-### Backend → Render
+**Why HNSW at m=16, ef_construction=96 specifically?**
+Per pgvector production benchmarking: `m=16-24, ef_construction=96-128` is
+the sweet spot for embeddings under 1024 dimensions (we use 384-dim
+all-MiniLM-L6-v2). Higher `m` increases recall but costs roughly
+`4*m*N*1.1` bytes in graph edges alone — at `m=32` and 50M rows that's
+already ~7GB just for the graph structure, before counting vectors.
 
-1. New Web Service → connect repo
-2. Build command: `pip install -r requirements.txt`
-3. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-4. Add env var: `ANTHROPIC_API_KEY`
+**Why does confidence decay over time?**
+A fact consolidated in 2024 saying "quantum fault tolerance is 8 years
+away" shouldn't carry full weight in a 2026 query without being
+re-verified. Exponential decay (90-day half-life, floored at 15% of
+original) means stale facts fade in influence but never vanish entirely —
+they can still surface as "3 years ago, MARS concluded X" context.
 
-### Frontend → Vercel
-
-```bash
-cd frontend
-vercel
-# Set VITE_API_URL to your backend URL in Vercel project settings
-```
-
----
-
-## Theme
-
-The modern dark UI uses:
-
-- **DM Sans** — body text, UI labels
-- **DM Mono** — status text, tags, technical labels
-- Sidebar layout with per-agent status column
-- Color-coded agents with animated status dots
-- 4-tab main panel (agents / debate / beliefs / benchmarks)
-
-A classic editorial light theme (`App.classic.tsx`) is included in the `frontend-designs/` folder if you prefer that look.
-
----
-
-## Cost
-
-A typical research run makes ~10 API calls, each 200–500 tokens output.
-
-| Run type | Approx. cost |
-|---|---|
-| Standard query | ~$0.05–0.10 |
-| Complex query (longer outputs) | ~$0.15–0.25 |
-
-Using `claude-sonnet-4-6` at $3/$15 per M tokens input/output.
-
----
-
-## License
-
-MIT
+**Why do contradictions get flagged instead of resolved?**
+Semantic memory is not the authority on truth — the Critic agent is.
+Auto-resolving a contradiction (e.g. "newer wins") would silently discard
+information that might actually be correct. Flagging preserves both
+claims and routes the decision to the part of the system designed to
+adjudicate evidence.
