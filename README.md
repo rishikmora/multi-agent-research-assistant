@@ -10,7 +10,7 @@ Production implementation of Week 1 from the intelligence upgrade roadmap.
 │  Scope: current session only. TTL: 2 hours.                     │
 │  - Agent outputs as they complete                                │
 │  - Live confidence scores (atomic Lua-script updates)           │
-│  - Debate transcript (bounded to 30 messages)                   │
+│  - Debate transcript (bounded to 30 messages)                   │ 
 │  - Live evidence graph state                                     │
 │  - Pub/sub for cross-process SSE notification                    │
 └───────────────────────┬───────────────────────────────────────────┘
@@ -19,7 +19,7 @@ Production implementation of Week 1 from the intelligence upgrade roadmap.
 ┌─────────────────────────────────────────────────────────────────┐
 │  TIER 2 — Episodic Memory (PostgreSQL)                          │
 │  Scope: permanent record of every completed session.             │
-│  - Append-only — never mutated, only superseded                  │
+│  - Append-only — never mutated, only superseded                  │ 
 │  - Fast-path topic index for exact/fuzzy lookup                  │
 │  - Retention: 180 days for superseded episodes (current           │
 │    conclusions on any topic are kept indefinitely)                │
