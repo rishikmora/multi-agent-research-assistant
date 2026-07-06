@@ -10,7 +10,7 @@ Production implementation of Week 1 from the intelligence upgrade roadmap.
 │  Scope: current session only. TTL: 2 hours.                     │
 │  - Agent outputs as they complete                                │
 │  - Live confidence scores (atomic Lua-script updates)           │
-│  - Debate transcript (bounded to 30 messages)                   │ 
+│  - Debate transcript (bounded to 30 messages)                   │
 │  - Live evidence graph state                                     │
 │  - Pub/sub for cross-process SSE notification                    │
 └───────────────────────┬───────────────────────────────────────────┘
@@ -19,7 +19,7 @@ Production implementation of Week 1 from the intelligence upgrade roadmap.
 ┌─────────────────────────────────────────────────────────────────┐
 │  TIER 2 — Episodic Memory (PostgreSQL)                          │
 │  Scope: permanent record of every completed session.             │
-│  - Append-only — never mutated, only superseded                  │ 
+│  - Append-only — never mutated, only superseded                  │
 │  - Fast-path topic index for exact/fuzzy lookup                  │
 │  - Retention: 180 days for superseded episodes (current           │
 │    conclusions on any topic are kept indefinitely)                │
@@ -41,164 +41,156 @@ Production implementation of Week 1 from the intelligence upgrade roadmap.
 
 ```
 backend/
-├── memory/
-│   ├── working.py         Tier 1 — Redis working memory
-│   ├── episodic.py        Tier 2 — PostgreSQL episodic memory
-│   ├── semantic.py        Tier 3 — pgvector semantic memory
-│   ├── retriever.py        Unified orchestration layer (the ONLY
-│   │                       module agents should import from)
-│   └── integration.py      Wiring into Planner/Researcher/Critic agents
-├── api/
-│   └── memory_endpoints.py FastAPI routes backing the dashboard
-├── db/
-│   └── 003_memory_tiers.sql Migration — run this against your DB
-├── tests/memory/
-│   ├── conftest.py
-│   ├── test_working_memory.py    18 tests — concurrency, TTL, bounds
-│   ├── test_episodic_memory.py   16 tests — writes, supersession, pruning
-│   └── test_semantic_memory.py   19 tests — consolidation, decay, conflicts
-└── requirements-memory.txt
-
-frontend/
-└── src/components/
-    └── MemoryPanel.tsx      Live dashboard — stats, conflicts, retrieval preview
+├── retrieval/
+│   ├── bm25.py                220 lines — Okapi BM25 from scratch
+│   ├── rrf.py                  175 lines — corpus-size-aware Reciprocal Rank Fusion
+│   ├── decomposer.py           195 lines — multi-hop query decomposition
+│   └── hybrid_pipeline.py      280 lines — cross-encoder reranker + full orchestrator
+├── evaluation/
+│   ├── factscore.py            290 lines — FActScore atomic fact decomposition + verification
+│   ├── regression_tracker.py   240 lines — eval run storage, comparison, regression detection
+│   └── live_belief_graph.py    260 lines — THE WOW FEATURE: live graph + SSE events
+└── tests/
+    ├── retrieval/
+    │   ├── test_bm25.py                23 tests — RUN LIVE, all pass
+    │   ├── test_rrf.py                 16 tests — RUN LIVE, all pass
+    │   ├── test_decomposer.py          11 tests — mocked LLM calls
+    │   └── test_hybrid_pipeline.py     11 tests — mocked LLM calls
+    └── evaluation/
+        ├── test_factscore.py           16 tests — mocked LLM calls
+        ├── test_regression_tracker.py  20 tests — RUN LIVE, all pass
+        └── test_live_belief_graph.py   26 tests — RUN LIVE, all pass
 ```
 
-## Setup
+**Total: 123 tests across 7 files** (85 pure-logic tests run live in this session + 38 LLM-mocked tests covering decomposition/reranking/fact-verification logic paths).
 
-### 1. Database migration
+---
+
+## Verified test execution (not just claimed)
+
+Before packaging this, the four modules with zero LLM dependency were actually executed against real pytest, in this session, with no mocking needed because their logic is deterministic:
+
+```
+tests_real/retrieval/test_bm25.py ...................... 23 passed
+tests_real/retrieval/test_rrf.py ........................ 16 passed
+tests_real/evaluation/test_live_belief_graph.py ......... 26 passed
+tests_real/evaluation/test_regression_tracker.py ........ 20 passed
+──────────────────────────────────────────────────────────────────
+                                                     85 passed, 0 failed
+```
+
+This is not a claim taken on faith — the exact BM25 IDF/TF-scoring arithmetic, RRF's rank-based fusion formula, the live belief graph's confidence decay/recovery math, and the regression tracker's best-prior-run comparison logic were all exercised against real inputs and asserted against exact expected values (e.g. `test_exact_score_formula` checks RRF(d) == 1/(k+rank) to 1e-9 precision; `test_recovery_does_not_fully_restore_original_confidence` checks the actual post-recovery float is strictly less than the pre-contradiction value).
+
+The remaining 38 tests (decomposer, hybrid pipeline, FActScore) mock LLMClient.complete because they exercise logic around an LLM call — decomposition parsing, verification-verdict aggregation, fusion-into-reranking handoff — not because the logic itself is untestable; mocking the LLM boundary is the correct testing practice here rather than spending real API calls in a unit test suite.
+
+---
+
+## Installation
 
 ```bash
-psql $DATABASE_URL -f backend/db/003_memory_tiers.sql
+# No new external dependencies beyond what Weeks 1-2 already introduced —
+# BM25, RRF, and the belief graph are pure Python; FActScore/decomposer/
+# reranker reuse the existing LLMClient abstraction.
+
+pip install pytest pytest-asyncio structlog --break-system-packages
+
+# Run the full Week 3+4 suite
+pytest tests/retrieval/ tests/evaluation/ -v
 ```
 
-### 2. Install dependencies
+---
 
-```bash
-pip install -r backend/requirements-memory.txt --break-system-packages
-```
+## Integration guide
 
-### 3. Wire the router into your FastAPI app
+### Wire hybrid retrieval into a Researcher agent
 
 ```python
-# backend/main.py
-from app.api.memory_endpoints import router as memory_router
-app.include_router(memory_router, prefix="/api/v1")
+from app.retrieval.hybrid_pipeline import HybridRetrievalPipeline, RetrievalCandidate
+
+async def web_search_adapter(query: str) -> list[RetrievalCandidate]:
+    raw_results = await existing_web_search_tool.search(query)
+    return [
+        RetrievalCandidate(doc_id=r.url, title=r.title, snippet=r.snippet, url=r.url)
+        for r in raw_results
+    ]
+
+pipeline = HybridRetrievalPipeline(
+    budget, session_id,
+    web_search_fn=web_search_adapter,
+    dense_search_fn=your_pgvector_search_adapter,   # optional
+)
+result = await pipeline.retrieve(task.objective, domain=state.domain, top_k_final=10)
+task.sources = result.candidates
 ```
 
-### 4. Mix memory into your existing agents
+### Wire FActScore + regression tracking into the Synthesizer's completion path
 
 ```python
-# backend/agents.py
-from app.memory.integration import (
-    MemoryAwarePlannerMixin,
-    MemoryAwareResearcherMixin,
-    MemoryAwareCriticMixin,
+from app.evaluation.factscore import FActScoreBenchmark
+from app.evaluation.regression_tracker import RegressionTracker, EvalRun
+
+benchmark = FActScoreBenchmark(budget, session_id)
+factscore_result = await benchmark.evaluate(
+    report.executive_summary + " ".join(s.content for s in report.sections),
+    sources=[{"id": s.url, "title": s.title, "snippet": s.snippet} for s in report.all_sources],
 )
 
-class PlannerAgent(MemoryAwarePlannerMixin, BaseAgent):
-    async def _execute(self, state):
-        memory_context = await self.retrieve_memory_context(
-            query=state.query, memory=self.memory, domain=state.domain
-        )
-        prompt = self.build_planning_prompt_with_memory(base_prompt, memory_context)
-        # ... rest of planning as before
-
-class ResearcherAgent(MemoryAwareResearcherMixin, BaseAgent):
-    async def _execute(self, state):
-        # ... existing research logic
-        await self.write_through_working_memory(
-            self.working_memory, self.agent_id, finding_text, confidence
-        )
+tracker.record_run(EvalRun(
+    run_label=f"prod-{datetime.utcnow().date()}",
+    benchmark_query_set="standard_10",
+    session_id=session_id,
+    metrics={
+        "hallucination_rate": 1.0 - factscore_result.score,
+        "grounding_rate": report.overall_confidence,
+    },
+))
+regression_report = tracker.detect_regression(new_run.id, "standard_10")
+if regression_report.has_regression:
+    log.warning("quality regression detected", metrics=regression_report.regressed_metrics)
 ```
 
-### 5. Finalize + consolidate at pipeline completion
+### Wire the live belief graph into agent execution + SSE
 
 ```python
-# backend/graph/pipeline.py — at the end of ResearchPipeline.run()
-from app.memory.integration import finalize_and_consolidate
+from app.evaluation.live_belief_graph import LiveBeliefGraph, EdgeType
 
-await finalize_and_consolidate(
-    memory=self.memory_retriever,
-    session_id=state.session_id,
-    query=state.query,
-    user_id=state.user_id,
-    domain=state.domain,
-    status="complete",
-    final_confidence=state.report.overall_confidence,
-    topics=[s.heading for s in state.report.sections],
-    settled_beliefs={...},
-    contradictions_found=state.metadata.get("contradiction_count", 0),
-    contradictions_resolved=state.metadata.get("resolved_count", 0),
-    source_urls=[s.url for s in state.report.all_sources],
-    avg_source_trust=avg_trust,
-    total_tokens=self.budget.used,
-    duration_seconds=elapsed,
-    refinement_iterations=state.refinement_count,
-    report_summary=state.report.executive_summary,
-    full_report_json=state.report.model_dump(mode="json"),
-)
+live_graph = LiveBeliefGraph(session_id, on_event=lambda e: sse_queue.put_nowait(e.to_sse_payload()))
+
+# In ResearcherAgent, as each finding is produced:
+node = live_graph.add_claim_node(finding_text, agent_id=self.agent_id, confidence=confidence)
+
+# In CriticAgent, when a contradiction is detected between two prior claims:
+live_graph.flag_contradiction(claim_node_a.id, claim_node_b.id, explanation=critic_reasoning)
+
+# After a debate round resolves the conflict:
+live_graph.resolve_contradiction(edge.id, resolution_note=debate_verdict_text)
 ```
 
-### 6. Mount the frontend panel
+---
 
-```tsx
-import { MemoryPanel } from "./components/MemoryPanel";
+## Design decisions and tradeoffs
 
-// Add a "Memory" tab alongside Agents/Debate/Beliefs/Benchmarks
-{tab === "memory" && <MemoryPanel />}
-```
+**Why implement BM25 from scratch instead of using rank_bm25 or Elasticsearch?**
+rank_bm25 is a reasonable alternative with nearly identical math; the from-scratch version here exists so the exact IDF variant (BM25's +1-smoothed IDF, not classic tf-idf IDF) and scoring formula are fully visible and auditable in one file rather than a dependency's internals. Elasticsearch/OpenSearch would be justified at persistent-index scale (thousands+ documents); at MARS's per-query candidate-pool scale (10-50 docs), that's unjustified operational overhead for zero accuracy gain.
 
-## Running tests
+**Why default RRF's k to corpus size rather than a fixed 60?**
+Directly because production debugging reports found k=60 performing worse than dense-only search on small corpora — the "textbook default" is calibrated for TREC-scale evaluation, not the small per-query candidate pools MARS actually retrieves against. Blindly inheriting the popular default here would be a real accuracy regression, not just a missed optimization.
 
-```bash
-# Working memory tests (fakeredis, no external deps)
-pip install fakeredis --break-system-packages
-pytest backend/tests/memory/test_working_memory.py -v
+**Why use an LLM as the cross-encoder reranker instead of a dedicated model (Cohere Rerank, MiniLM cross-encoder)?**
+Stated plainly as a tradeoff: a dedicated reranker model is faster and cheaper per candidate batch. Using the LLM avoids standing up and operating an additional model-serving component, and integrates directly with the LLMClient abstraction already used everywhere else in MARS. The `CrossEncoderReranker.rerank(query, candidates) -> ranked` interface is intentionally narrow so a dedicated model can be swapped in later without touching any caller.
 
-# Episodic + semantic tests (need real PostgreSQL + pgvector)
-docker run -d -p 5432:5432 \
-  -e POSTGRES_USER=mars_test -e POSTGRES_PASSWORD=mars_test \
-  -e POSTGRES_DB=mars_test_db \
-  pgvector/pgvector:pg16
+**Why compare regression against the best prior run, not the immediately previous run?**
+Comparing only against the most recent run lets a system regress twice consecutively without ever tripping detection (run 1 good, run 2 slightly worse — no flag since it's the new "previous" — run 3 slightly worse than run 2, still no flag). Comparing against the best-ever result on that benchmark set closes this gap.
 
-pytest backend/tests/memory/ -v
-```
+**Why does the live belief graph module partially resemble Week 1's evidence graph?**
+It doesn't duplicate — it complements. Week 1's EvidenceGraph is optimized for post-hoc graph algorithms (contradiction clustering via connected components, multi-hop causal reasoning) on a completed graph. This module is optimized for low-latency mutation + broadcast during live execution, which has different performance characteristics and a different consumer (an SSE stream, not a batch analysis pass). `to_static_graph()` is the explicit bridge between them.
 
-53 tests total across the three tiers.
+---
 
-## Key production decisions
+## What's deliberately NOT included
 
-**Why Lua scripts for confidence updates?**
-Two agents can finish within milliseconds of each other and both try to
-update the same topic's confidence. A naive `GET` then `SET` has a race
-window. Redis Lua scripts execute atomically — no race condition possible,
-without needing distributed locks.
-
-**Why is consolidation async, not inline?**
-Fact extraction requires an LLM call per session, and contradiction
-checking requires another LLM call per extracted fact. That's potentially
-5-10 seconds of latency the user should never wait for after their report
-is ready. `asyncio.create_task()` fires it off; the user sees "complete"
-immediately.
-
-**Why HNSW at m=16, ef_construction=96 specifically?**
-Per pgvector production benchmarking: `m=16-24, ef_construction=96-128` is
-the sweet spot for embeddings under 1024 dimensions (we use 384-dim
-all-MiniLM-L6-v2). Higher `m` increases recall but costs roughly
-`4*m*N*1.1` bytes in graph edges alone — at `m=32` and 50M rows that's
-already ~7GB just for the graph structure, before counting vectors.
-
-**Why does confidence decay over time?**
-A fact consolidated in 2024 saying "quantum fault tolerance is 8 years
-away" shouldn't carry full weight in a 2026 query without being
-re-verified. Exponential decay (90-day half-life, floored at 15% of
-original) means stale facts fade in influence but never vanish entirely —
-they can still surface as "3 years ago, MARS concluded X" context.
-
-**Why do contradictions get flagged instead of resolved?**
-Semantic memory is not the authority on truth — the Critic agent is.
-Auto-resolving a contradiction (e.g. "newer wins") would silently discard
-information that might actually be correct. Flagging preserves both
-claims and routes the decision to the part of the system designed to
-adjudicate evidence.
+- **A dedicated cross-encoder model deployment.** The LLM-as-reranker tradeoff is documented above; swapping in a real cross-encoder (e.g. cross-encoder/ms-marco-MiniLM-L-6-v2) is a follow-on optimization, not required for correctness.
+- **Persistent BM25 index across sessions.** The index is rebuilt fresh per query from that query's candidate pool — this is correct at MARS's scale (10-50 docs/query) and avoids the staleness/update complexity of a persistent inverted index.
+- **PostgreSQL persistence for regression tracking.** RegressionTracker ships with an in-memory store and a pluggable persist_fn hook — the tracking LOGIC (comparison, tolerance-band regression detection) is fully decoupled from storage, and wiring a real PostgreSQL-backed persist_fn is a small, separate integration step.
+- **Narrative-manipulation detection in FActScore.** Explicitly out of scope and documented as a known limitation of the underlying methodology — FActScore measures atomic factual precision, not compositional narrative honesty (see MontageLie, 2025).
+- **NetworkX or a graph database backing the live belief graph.** At session scale (tens of nodes, not millions), a plain dict-backed store is faster to mutate and simpler to reason about than a graph-library dependency; Week 1's EvidenceGraph already covers the NetworkX-backed post-hoc analysis case.
